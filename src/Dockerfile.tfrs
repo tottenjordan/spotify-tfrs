@@ -1,0 +1,13 @@
+
+# Dockerfile-gpu
+FROM gcr.io/deeplearning-platform-release/tf-gpu.2-9
+
+WORKDIR /src
+
+# Copies the trainer code to the docker image.
+COPY trainer/* trainer/ 
+
+RUN pip install -r trainer/requirements.txt
+
+# Sets up the entry point to invoke the trainer.
+# ENTRYPOINT ["python", "-m", "trainer.task"]
