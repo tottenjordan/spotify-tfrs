@@ -1,6 +1,5 @@
 
-# Dockerfile-gpu
-FROM gcr.io/deeplearning-platform-release/tf-gpu.2-9
+FROM tensorflow/tensorflow:2.9.2-gpu
 
 WORKDIR /src
 
@@ -9,5 +8,5 @@ COPY trainer/* trainer/
 
 RUN pip install -r trainer/requirements.txt
 
-# Sets up the entry point to invoke the trainer.
-# ENTRYPOINT ["python", "-m", "trainer.task"]
+# # Sets up the entry point to invoke the trainer.
+# # ENTRYPOINT ["python", "-m", "trainer.task"]
