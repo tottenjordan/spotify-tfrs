@@ -35,9 +35,9 @@ def get_arch_from_string(arch_string):
 # ====================================================
 # Main
 # ====================================================
-import _data
-import _model
-import train_config as config
+import _data as trainer_data
+import _model as trainer_model
+import train_config as cfg
 import time 
 
 TIMESTAMP = time.strftime("%Y%m%d-%H%M%S")
@@ -50,6 +50,8 @@ def main(args):
     storage_client = storage.Client(
         project=args.project
     )
+    
+    WORKING_DIR = f'gs://{args.model_dir}/{args.version}'
     
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
@@ -169,8 +171,8 @@ def main(args):
         
     # Parse train dataset
     raw_train_dataset = tf.data.TFRecordDataset(train_files)
-    parsed_dataset = raw_train_dataset.map(_data.parse_tfrecord_fn)
-    parsed_dataset_padded = parsed_dataset.map(_data.return_padded_tensors)  
+    parsed_dataset = raw_train_dataset.map(trainer_data.parse_tfrecord_fn) # _data
+    parsed_dataset_padded = parsed_dataset.map(trainer_data.return_padded_tensors) # _data  
     
     # ====================================================
     # Parse candidates dataset
@@ -184,7 +186,7 @@ def main(args):
         candidate_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
         
     raw_candidate_dataset = tf.data.TFRecordDataset(candidate_files)
-    parsed_candidate_dataset = raw_candidate_dataset.map(_data.parse_candidate_tfrecord_fn)
+    parsed_candidate_dataset = raw_candidate_dataset.map(trainer_data.parse_candidate_tfrecord_fn) # _data
     
     # ====================================================
     # Prepare Train and Valid Data
@@ -196,7 +198,7 @@ def main(args):
     # train_data = shuffled_parsed_ds.take(80_000).batch(128)
     # valid_data = shuffled_parsed_ds.skip(80_000).take(20_000).batch(128)
     
-    valid_size = 20_000 # config.VALID_SIZE # 20_000 # args.valid_size
+    valid_size = 20_000 # cfg.VALID_SIZE # 20_000 # args.valid_size
     valid = shuffled_parsed_ds.take(valid_size)
     train = shuffled_parsed_ds.skip(valid_size)
     cached_train = train.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
@@ -221,8 +223,8 @@ def main(args):
     hyperparams["batch_size"] = int(args.batch_size)
     hyperparams["embedding_dim"] = args.embedding_dim
     hyperparams["projection_dim"] = args.projection_dim
-    hyperparams["use_cross_layer"] = config.USE_CROSS_LAYER
-    hyperparams["use_dropout"] = config.USE_DROPOUT
+    hyperparams["use_cross_layer"] = cfg.USE_CROSS_LAYER # args.use_cross_layer
+    hyperparams["use_dropout"] = cfg.USE_DROPOUT # args.use_dropout
     hyperparams["dropout_rate"] = args.dropout_rate
     hyperparams['layer_sizes'] = args.layer_sizes
     
@@ -247,38 +249,22 @@ def main(args):
     LAYER_SIZES = get_arch_from_string(args.layer_sizes)
     logging.info(f'LAYER_SIZES: {LAYER_SIZES}')
     
-    logging.info(f'adapting layers: {config.NEW_ADAPTS}')
+    logging.info(f'adapting layers: {cfg.NEW_ADAPTS}') # args.new_adapts | cfg.NEW_ADAPTS
+    
     # Wrap variable creation within strategy scope
     with strategy.scope():
 
-        model = _model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset)
+        model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset)
         
-        if config.NEW_ADAPTS:
-            model.query_tower.pl_name_text_embedding.layers[0].adapt(parsed_dataset_padded.map(lambda x: x['name']).batch(args.batch_size)) # TODO: adapts on full dataset or train only?
-            # vocab_dict_load['name'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-            
-#             model.candidate_tower.artist_name_can_text_embedding.layers[0].adapt(parsed_dataset_padded.map(lambda x: x['artist_name_can']).batch(args.batch_size))
-#             # vocab_dict_load['artist_name_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-            
-#             model.candidate_tower.track_name_can_text_embedding.layers[0].adapt(parsed_dataset_padded.map(lambda x: x['track_name_can']).batch(args.batch_size))
-#             # vocab_dict_load['track_name_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-            
-#             model.candidate_tower.album_name_can_text_embedding.layers[0].adapt(parsed_dataset_padded.map(lambda x: x['album_name_can']).batch(args.batch_size))
-#             # vocab_dict_load['album_name_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-            
-#             model.candidate_tower.artist_genres_can_text_embedding.layers[0].adapt(parsed_dataset_padded.map(lambda x: x['artist_genres_can']).batch(args.batch_size))
-#             # vocab_dict_load['artist_genres_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
+        if cfg.NEW_ADAPTS:
+            model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: adapts on full dataset or train onl
             
         model.compile(optimizer=tf.keras.optimizers.Adagrad(args.learning_rate))
         
-    if config.NEW_ADAPTS:
+    if cfg.NEW_ADAPTS:
         vocab_dict_load['name'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-    #     vocab_dict_load['artist_name_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-    #     vocab_dict_load['track_name_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-    #     vocab_dict_load['album_name_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-    #     vocab_dict_load['artist_genres_can'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
         bucket = storage_client.bucket(args.model_dir)
-        blob = bucket.blob(f'vocabs_stats/vocab_dict_{args.version}.txt')
+        blob = bucket.blob(f'{args.version}/vocabs_stats/vocab_dict_{args.version}.txt')
         pickle_out = pkl.dumps(vocab_dict_load)
         blob.upload_from_string(pickle_out)
     
@@ -286,9 +272,12 @@ def main(args):
         
     tf.random.set_seed(args.seed)
     
+    logs_dir = f"{WORKING_DIR}/tb-logs-{RUN_NAME}"
+    AIP_LOGS = os.environ.get('AIP_TENSORBOARD_LOG_DIR', f'{logs_dir}')
+    logging.info(f'TensorBoard logdir: {AIP_LOGS}')
     
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
-        log_dir=f"gs://{args.model_dir}/logs-{RUN_NAME}",
+        log_dir=AIP_LOGS,       # f"{WORKING_DIR}/tb-logs-{RUN_NAME}",
         histogram_freq=0, 
         write_graph=True, 
         profile_batch = '500,520'
@@ -415,11 +404,11 @@ def parse_args():
     parser.add_argument('--seed', 
                         default=1234, type=str, help='#TODO', required=False)
 
-#     parser.add_argument('--use_cross_layer', 
-#                         default=True, type=bool, help='#TODO', required=False)
+    parser.add_argument('--use_cross_layer', 
+                        default=True, type=bool, help='#TODO', required=False)
 
-#     parser.add_argument('--use_dropout', 
-#                         default=False, type=bool, help='#TODO', required=False)
+    parser.add_argument('--use_dropout', 
+                        default=False, type=bool, help='#TODO', required=False)
 
     parser.add_argument('--dropout_rate', 
                         default=0.4, type=float, help='#TODO', required=False)
@@ -430,8 +419,8 @@ def parse_args():
     # parser.add_argument('--aip_tb_logs', 
     #                     default=os.getenv('AIP_TENSORBOARD_LOG_DIR'), type=str, help='#TODO', required=False)
 
-    # parser.add_argument('--new_adapts', 
-    #                     default=False, type=bool, help='#TODO', required=False)
+    parser.add_argument('--new_adapts', 
+                        default=False, type=bool, help='#TODO', required=False)
 
     parser.add_argument('--learning_rate', 
                         default=0.01, type=float, help='learning rate', required=False)

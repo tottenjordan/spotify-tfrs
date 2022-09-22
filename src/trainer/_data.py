@@ -1,9 +1,9 @@
 
 import tensorflow as tf
 
-import train_config as config
+import train_config as cfg
 
-MAX_PLAYLIST_LENGTH = config.MAX_PADDING # 375
+MAX_PLAYLIST_LENGTH = cfg.MAX_PADDING # 375
 
 def pad_up_to(t, max_in_dims=[1 ,MAX_PLAYLIST_LENGTH], constant_value=''):
     s = tf.shape(t)
