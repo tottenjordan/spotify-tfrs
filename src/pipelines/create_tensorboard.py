@@ -14,7 +14,8 @@ from kfp.v2.dsl import (Artifact, Dataset, Input, InputPath, Model, Output,
 def create_tensorboard(
     project: str,
     location: str,
-    version: str,
+    model_version: str,
+    pipeline_version: str,
     gcs_bucket_name: str,
     model_display_name: str,
     create_tb_resource: bool,
@@ -34,7 +35,7 @@ def create_tensorboard(
         location=location,
     )
 
-    TENSORBOARD_DISPLAY_NAME = f"tb-{model_display_name}-{version}"
+    TENSORBOARD_DISPLAY_NAME = f"tb-{model_display_name}-{model_version}"
 
     if create_tb_resource==True:
         logging.info(f"TENSORBOARD_DISPLAY_NAME: {TENSORBOARD_DISPLAY_NAME}")

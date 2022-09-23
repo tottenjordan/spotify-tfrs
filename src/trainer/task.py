@@ -51,7 +51,8 @@ def main(args):
         project=args.project
     )
     
-    WORKING_DIR = f'gs://{args.model_dir}/{args.version}'
+    WORKING_DIR = f'gs://{args.train_output_gcs_bucket}'             # replaced f'gs://{args.model_dir}/{args.version}'
+    logging.info(f'Train job output directory: {WORKING_DIR}')
     
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
@@ -106,7 +107,7 @@ def main(args):
     BUCKET_NAME = 'spotify-v1'
     FILE_PATH = 'vocabs/v1_string_vocabs'
     FILE_NAME = 'string_vocabs_v1_20220705-202905.txt'
-    DESTINATION_FILE = 'downloaded_vocabs.txt'
+    DESTINATION_FILE = 'downloaded_vocabs.txt'     # TODO: args.vocab_file
 
     with open(f'{DESTINATION_FILE}', 'wb') as file_obj:
         storage_client.download_blob_to_file(
@@ -159,27 +160,49 @@ def main(args):
     vocab_dict_load['var_track_pop']=var_track_pop
 
     # ====================================================
-    # Parse & Pad train dataset
+    # TRAIN dataset - Parse & Pad
     # ====================================================
 
-    logging.info(f'args.train_dir: {args.train_dir}')
-    logging.info(f'args.train_dir_prefix: {args.train_dir_prefix}')
+    # logging.info(f'Getting train data from bucket: {args.train_dir}')
+    # logging.info(f'args.train_dir_prefix: {args.train_dir_prefix}')
+    
+    logging.info(f'Path to TRAIN files: gs://{args.train_dir}/{args.train_dir_prefix}')
     
     train_files = []
     for blob in storage_client.list_blobs(f'{args.train_dir}', prefix=f'{args.train_dir_prefix}', delimiter="/"):
         train_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
         
     # Parse train dataset
-    raw_train_dataset = tf.data.TFRecordDataset(train_files)
-    parsed_dataset = raw_train_dataset.map(trainer_data.parse_tfrecord_fn) # _data
-    parsed_dataset_padded = parsed_dataset.map(trainer_data.return_padded_tensors) # _data  
+    raw_train_ds = tf.data.TFRecordDataset(train_files)
+    parsed_train_ds = raw_train_ds.map(trainer_data.parse_tfrecord_fn) # _data
+    parsed_padded_train_ds = parsed_train_ds.map(trainer_data.return_padded_tensors) # _data
+    
+    # ====================================================
+    # VALID dataset - Parse & Pad 
+    # ====================================================
+    
+    # logging.info(f'args.valid_dir: {args.valid_dir}')                   # TODO: args.valid_dir
+    # logging.info(f'args.valid_dir_prefix: {args.valid_dir_prefix}')     # TODO: args.valid_dir_prefix
+    
+    logging.info(f'Path to VALID files: gs://{args.valid_dir}/{args.valid_dir_prefix}')
+    
+    valid_files = []
+    for blob in storage_client.list_blobs(f'{args.valid_dir}', prefix=f'{args.valid_dir_prefix}', delimiter="/"):
+        valid_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
+        
+    # Parse train dataset
+    raw_valid_ds = tf.data.TFRecordDataset(valid_files)
+    parsed_valid_ds = raw_valid_ds.map(trainer_data.parse_tfrecord_fn) # _data
+    parsed_padded_valid_ds = parsed_valid_ds.map(trainer_data.return_padded_tensors) # _data
     
     # ====================================================
     # Parse candidates dataset
     # ====================================================
 
-    logging.info(f'args.candidate_file_dir: {args.candidate_file_dir}')
-    logging.info(f'args.candidate_files_prefix: {args.candidate_files_prefix}')
+    # logging.info(f'args.candidate_file_dir: {args.candidate_file_dir}')
+    # logging.info(f'args.candidate_files_prefix: {args.candidate_files_prefix}')
+    
+    logging.info(f'Path to CANDIDATE files: gs://{args.candidate_file_dir}/{args.candidate_files_prefix}')
 
     candidate_files = []
     for blob in storage_client.list_blobs(f'{args.candidate_file_dir}', prefix=f'{args.candidate_files_prefix}', delimiter="/"):
@@ -193,16 +216,25 @@ def main(args):
     # ====================================================
     logging.info(f'preparing train and valid splits...')
     tf.random.set_seed(42)
-    shuffled_parsed_ds = parsed_dataset_padded.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
+    
+    # TRAIN
+    shuffled_parsed_train_ds = parsed_padded_train_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
+    cached_train = shuffled_parsed_train_ds.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
+    
+    # VALID
+    # shuffled_parsed_train_ds = parsed_padded_valid_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
+    cached_valid = parsed_padded_valid_ds.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
+    
+    logging.info(f'TRAIN and VALID prepped...')
 
     # train_data = shuffled_parsed_ds.take(80_000).batch(128)
     # valid_data = shuffled_parsed_ds.skip(80_000).take(20_000).batch(128)
     
-    valid_size = 20_000 # cfg.VALID_SIZE # 20_000 # args.valid_size
-    valid = shuffled_parsed_ds.take(valid_size)
-    train = shuffled_parsed_ds.skip(valid_size)
-    cached_train = train.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
-    cached_valid = valid.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
+    # valid_size = 20_000 # cfg.VALID_SIZE # 20_000 # args.valid_size
+    # valid = shuffled_parsed_ds.take(valid_size)
+    # train = shuffled_parsed_ds.skip(valid_size)
+    # cached_train = train.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
+    # cached_valid = valid.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
     
     # ====================================================
     # metaparams for Vertex Ai Experiments
@@ -216,6 +248,9 @@ def main(args):
     metaparams = {}
     metaparams["experiment_name"] = f'{EXPERIMENT_NAME}'
     metaparams["experiment_run"] = f"{RUN_NAME}"
+    metaparams["model_version"] = f"{args.model_version}"
+    metaparams["pipe_version"] = f"{args.pipeline_version}"
+    metaparams["data_regime"] = f"{args.data_regime}"
     metaparams["distribute"] = f'{args.distribute}'
     
     hyperparams = {}
@@ -256,15 +291,21 @@ def main(args):
 
         model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset)
         
-        if cfg.NEW_ADAPTS:
-            model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: adapts on full dataset or train onl
+        model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_train_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: use cached_train or shuffled_parsed_train_ds ?
+        # artist_name_can
+        # track_name_can
+        # album_name_can
+        # artist_genres_can
+        
+        # if cfg.NEW_ADAPTS:
+            # model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: adapts on full dataset or train onl
             
         model.compile(optimizer=tf.keras.optimizers.Adagrad(args.learning_rate))
         
     if cfg.NEW_ADAPTS:
         vocab_dict_load['name'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-        bucket = storage_client.bucket(args.model_dir)
-        blob = bucket.blob(f'{args.version}/vocabs_stats/vocab_dict_{args.version}.txt')
+        bucket = storage_client.bucket(args.train_output_gcs_bucket)                               # TODO: args.train_output_gcs_bucket # replaced args.model_dir
+        blob = bucket.blob(f'{EXPERIMENT_NAME}/{RUN_NAME}/vocabs_stats/vocab_dict_{RUN_NAME}.txt') # replaced f'{args.version}/vocabs_stats/vocab_dict_{RUN_NAME}.txt'
         pickle_out = pkl.dumps(vocab_dict_load)
         blob.upload_from_string(pickle_out)
     
@@ -272,12 +313,12 @@ def main(args):
         
     tf.random.set_seed(args.seed)
     
-    logs_dir = f"{WORKING_DIR}/tb-logs-{RUN_NAME}"
+    logs_dir = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/tb-logs'         # replaced f"{WORKING_DIR}/tb-logs-{RUN_NAME}" 
     AIP_LOGS = os.environ.get('AIP_TENSORBOARD_LOG_DIR', f'{logs_dir}')
     logging.info(f'TensorBoard logdir: {AIP_LOGS}')
     
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
-        log_dir=AIP_LOGS,       # f"{WORKING_DIR}/tb-logs-{RUN_NAME}",
+        log_dir=AIP_LOGS,
         histogram_freq=0, 
         write_graph=True, 
         profile_batch = '500,520'
@@ -330,10 +371,12 @@ def main(args):
     # Save Towers
     # ====================================================
     
-    logging.info(f'Saving models to {args.model_dir}')
+    # logging.info(f'Saving models to {args.model_dir}')                                        # TODO: f'gs://args.train_output_gcs_bucket/{EXPERIMENT_NAME}/{RUN_NAME}/model-dir
+    MODEL_DIR_GCS_URI = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/model-dir'
+    logging.info(f'Saving models to {MODEL_DIR_GCS_URI}')
 
-    query_dir_save = f"gs://{args.model_dir}/{args.version}/{RUN_NAME}/query_tower/" #+ FLAGS.TS 
-    candidate_dir_save = f"gs://{args.model_dir}/{args.version}/{RUN_NAME}/candidate_tower/" #+ FLAGS.TS 
+    query_dir_save = f"{MODEL_DIR_GCS_URI}/query_tower/"                                      # replaced: f"gs://{args.model_dir}/{args.version}/{RUN_NAME}/query_tower/" 
+    candidate_dir_save = f"{MODEL_DIR_GCS_URI}/candidate_tower/"                              # replaced: f"gs://{args.model_dir}/{args.version}/{RUN_NAME}/candidate_tower/"
     logging.info(f'Saving chief query model to {query_dir_save}')
     
     # save model from primary node in multiworker
@@ -369,13 +412,28 @@ def parse_args():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir',
-                        default=os.getenv('AIP_MODEL_DIR'), type=str, help='Model dir', required=False)
+                        default=os.getenv('AIP_MODEL_DIR'), type=str, help='Model dir', required=False) # TODO: sunset this arg
+    
+    parser.add_argument('--train_output_gcs_bucket',
+                        default=os.getenv('AIP_MODEL_DIR'), type=str, help='bucket for train job output', required=False) # TODO: use this
     
     parser.add_argument('--train_dir', 
-                        type=str, help='dir of training files', required=True)
-
+                        type=str, help='bucket holding training files', required=True)
+    
+    parser.add_argument('--train_dir_prefix', 
+                        type=str, help='file path under GCS bucket', required=True)
+    
+    parser.add_argument('--valid_dir', 
+                        type=str, help='bucket holding valid files', required=True)
+    
+    parser.add_argument('--valid_dir_prefix', 
+                        type=str, help='file path under GCS bucket', required=True)
+    
     parser.add_argument('--candidate_file_dir', 
-                        type=str, help='dir of candidate files', required=True)
+                        type=str, help='bucket holding candidate files', required=True)
+
+    parser.add_argument('--candidate_files_prefix', 
+                        type=str, help='file path under GCS bucket', required=True)
 
     parser.add_argument('--project', 
                         type=str, help='project', required=True)
@@ -404,11 +462,11 @@ def parse_args():
     parser.add_argument('--seed', 
                         default=1234, type=str, help='#TODO', required=False)
 
-    parser.add_argument('--use_cross_layer', 
-                        default=True, type=bool, help='#TODO', required=False)
+#     parser.add_argument('--use_cross_layer', 
+#                         default=True, type=bool, help='#TODO', required=False)
 
-    parser.add_argument('--use_dropout', 
-                        default=False, type=bool, help='#TODO', required=False)
+#     parser.add_argument('--use_dropout', 
+#                         default=False, type=bool, help='#TODO', required=False)
 
     parser.add_argument('--dropout_rate', 
                         default=0.4, type=float, help='#TODO', required=False)
@@ -419,14 +477,14 @@ def parse_args():
     # parser.add_argument('--aip_tb_logs', 
     #                     default=os.getenv('AIP_TENSORBOARD_LOG_DIR'), type=str, help='#TODO', required=False)
 
-    parser.add_argument('--new_adapts', 
-                        default=False, type=bool, help='#TODO', required=False)
+    # parser.add_argument('--new_adapts', 
+    #                     default=False, type=bool, help='#TODO', required=False)
 
     parser.add_argument('--learning_rate', 
                         default=0.01, type=float, help='learning rate', required=False)
 
-    parser.add_argument('--valid_size', 
-                        default='#TODO', type=str, help='number of records in valid split', required=False)
+    # parser.add_argument('--valid_size', 
+    #                     default='#TODO', type=str, help='number of records in valid split', required=False)
 
     parser.add_argument('--valid_frequency', 
                         default=10, type=int, help='number of epochs per metrics val calculation', required=False)
@@ -434,14 +492,18 @@ def parse_args():
     parser.add_argument('--distribute', 
                         default='single', type=str, help='TF strategy: single, mirrored, multiworker, tpu', required=False)
 
-    parser.add_argument('--version', 
-                        type=str, help='version of train code; for tracking', required=True)
+    # parser.add_argument('--version', 
+    #                     type=str, help='version of train code; for tracking', required=True)
+    
+    parser.add_argument('--model_version', 
+                        type=str, help='version of model train code', required=True)
+    
+    parser.add_argument('--pipeline_version', 
+                        type=str, help='version of pipeline code; v0 for non-pipeline execution', required=True)
+    
+    parser.add_argument('--data_regime', 
+                        type=str, help='id for tracking different datasets', required=True)
 
-    parser.add_argument('--train_dir_prefix', 
-                        type=str, help='file path under GCS bucket', required=True)
-
-    parser.add_argument('--candidate_files_prefix', 
-                        type=str, help='file path under GCS bucket', required=True)
 
     # args = parser.parse_args()
     return parser.parse_args()
