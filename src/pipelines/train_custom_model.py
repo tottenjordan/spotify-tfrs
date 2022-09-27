@@ -72,8 +72,8 @@ def train_custom_model(
     )
     
     # TODO: this is hardcoded, but created in train job
-    query_tower_dir_uri = f"gs://{output_dir_gcs_bucket_name}/{experiment_name}/{experiment_run}/model-dir/query_tower" 
-    candidate_tower_dir_uri = f"gs://{output_dir_gcs_bucket_name}/{experiment_name}/{experiment_run}/model-dir/candidate_tower"
+    query_tower_dir_uri = f"gs://{train_output_gcs_bucket}/{experiment_name}/{experiment_run}/model-dir/query_tower" 
+    candidate_tower_dir_uri = f"gs://{train_output_gcs_bucket}/{experiment_name}/{experiment_run}/model-dir/candidate_tower"
     # candidate_index_dir_uri = f"gs://{output_dir_gcs_bucket_name}/{experiment_name}/{experiment_run}/candidate-index"
     
     return (

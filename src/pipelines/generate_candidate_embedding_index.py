@@ -92,7 +92,7 @@ def generate_candidate_embedding_index(
     # candidate_items_prefix = 'v3/candidates-jt-tmp/'
 
     candidate_files = []
-    for blob in storage_client.list_blobs(f'{candidate_file_dir}', prefix=f'{candidate_items_prefix}', delimiter="/"):
+    for blob in storage_client.list_blobs(f'{candidate_file_dir}', prefix=f'{candidate_files_prefix}', delimiter="/"):
         if blob.name[-9:] == 'tfrecords':
             candidate_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
         else:

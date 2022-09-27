@@ -1,6 +1,7 @@
 
 import json
 import tensorflow as tf
+# from tensorflow.keras import mixed_precision
 import tensorflow_recommenders as tfrs
 from tensorflow.python.client import device_lib
 
@@ -13,6 +14,8 @@ import pickle as pkl
 from google.cloud import aiplatform as vertex_ai
 from google.cloud import storage
 import hypertune
+from google.cloud.aiplatform.training_utils import cloud_profiler
+
 
 import time
 import numpy as np
@@ -44,6 +47,8 @@ TIMESTAMP = time.strftime("%Y%m%d-%H%M%S")
 
 def main(args):
     
+    tf.debugging.set_log_device_placement(True)
+    
     logging.info("Starting training...")
     logging.info('TF_CONFIG = {}'.format(os.environ.get('TF_CONFIG', 'Not found')))
     
@@ -56,6 +61,15 @@ def main(args):
     
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    
+    TF_GPU_THREAD_MODE='gpu_private'
+    
+    # Mixed Precision
+    # logging.info(f'Setting Mixed Precision policy...')
+    # policy = mixed_precision.Policy('mixed_float16')
+    # mixed_precision.set_global_policy(policy)
+    # logging.info('Compute dtype: %s' % policy.compute_dtype)
+    # logging.info('Variable dtype: %s' % policy.variable_dtype)
     
     # AIP_TB_LOGS = args.aip_tb_logs # os.environ.get('AIP_TENSORBOARD_LOG_DIR', 'NA')
     # logging.info(f'AIP TENSORBOARD LOG DIR: {AIP_TB_LOGS}')
@@ -104,10 +118,10 @@ def main(args):
 
     # TODO: parameterize & configure for adapts vs vocab files
 
-    BUCKET_NAME = 'spotify-v1'
-    FILE_PATH = 'vocabs/v1_string_vocabs'
-    FILE_NAME = 'string_vocabs_v1_20220705-202905.txt'
-    DESTINATION_FILE = 'downloaded_vocabs.txt'     # TODO: args.vocab_file
+    BUCKET_NAME = 'spotify-v1'                           # args.vocab_gcs_bucket
+    FILE_PATH = 'vocabs/v2_string_vocabs'                # args.vocab_gcs_file_path
+    FILE_NAME = 'string_vocabs_v1_20220924-tokens22.pkl'   # args.vocab_filename
+    DESTINATION_FILE = 'downloaded_vocabs.txt'     
 
     with open(f'{DESTINATION_FILE}', 'wb') as file_obj:
         storage_client.download_blob_to_file(
@@ -116,48 +130,6 @@ def main(args):
 
     with open(f'{DESTINATION_FILE}', 'rb') as pickle_file:
         vocab_dict_load = pkl.load(pickle_file)
-
-
-    # TODO: include as a preprocessing step 
-    avg_duration_ms_seed_pl = 13000151.68
-    var_duration_ms_seed_pl = 133092900971233.58
-    vocab_dict_load['avg_duration_ms_seed_pl']=avg_duration_ms_seed_pl
-    vocab_dict_load['var_duration_ms_seed_pl']=var_duration_ms_seed_pl
-
-    avg_n_songs_pl = 55.21
-    var_n_songs_pl = 2317.54
-    vocab_dict_load['avg_n_songs_pl']=avg_n_songs_pl
-    vocab_dict_load['var_n_songs_pl']=var_n_songs_pl
-
-    avg_n_artists_pl = 30.56
-    var_n_artists_pl = 769.26
-    vocab_dict_load['avg_n_artists_pl']=avg_n_artists_pl
-    vocab_dict_load['var_n_artists_pl']=var_n_artists_pl
-
-    avg_n_albums_pl = 40.25
-    var_n_albums_pl = 1305.54
-    vocab_dict_load['avg_n_albums_pl']=avg_n_albums_pl
-    vocab_dict_load['var_n_albums_pl']=var_n_albums_pl
-
-    avg_artist_pop = 16.08
-    var_artist_pop = 300.64
-    vocab_dict_load['avg_artist_pop']=avg_artist_pop
-    vocab_dict_load['var_artist_pop']=var_artist_pop
-
-    avg_duration_ms_songs_pl = 234823.14
-    var_duration_ms_songs_pl = 5558806228.41
-    vocab_dict_load['avg_duration_ms_songs_pl']=avg_duration_ms_songs_pl
-    vocab_dict_load['var_duration_ms_songs_pl']=var_duration_ms_songs_pl
-
-    avg_artist_followers = 43337.77
-    var_artist_followers = 377777790193.57
-    vocab_dict_load['avg_artist_followers']=avg_artist_followers
-    vocab_dict_load['var_artist_followers']=var_artist_followers
-
-    avg_track_pop = 10.85
-    var_track_pop = 202.18
-    vocab_dict_load['avg_track_pop']=avg_track_pop
-    vocab_dict_load['var_track_pop']=var_track_pop
 
     # ====================================================
     # TRAIN dataset - Parse & Pad
@@ -173,9 +145,28 @@ def main(args):
         train_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
         
     # Parse train dataset
-    raw_train_ds = tf.data.TFRecordDataset(train_files)
-    parsed_train_ds = raw_train_ds.map(trainer_data.parse_tfrecord_fn) # _data
-    parsed_padded_train_ds = parsed_train_ds.map(trainer_data.return_padded_tensors) # _data
+    # raw_train_ds = tf.data.TFRecordDataset(train_files)
+    # parsed_train_ds = raw_train_ds.map(trainer_data.parse_tfrecord) # _data
+    # parsed_padded_train_ds = parsed_train_ds.map(trainer_data.return_padded_tensors) # _data
+    
+    # OPTIMIZE DATA INPUT PIPELINE
+    train_dataset = tf.data.Dataset.from_tensor_slices(train_files)
+    train_dataset = train_dataset.interleave(
+        lambda x: tf.data.TFRecordDataset(x),
+        cycle_length=tf.data.AUTOTUNE, 
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False
+    ).map(
+        trainer_data.parse_tfrecord,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).map(
+        trainer_data.return_padded_tensors,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).batch(
+        args.batch_size * strategy.num_replicas_in_sync
+    ).prefetch(
+        tf.data.AUTOTUNE,
+    )
     
     # ====================================================
     # VALID dataset - Parse & Pad 
@@ -191,9 +182,28 @@ def main(args):
         valid_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
         
     # Parse train dataset
-    raw_valid_ds = tf.data.TFRecordDataset(valid_files)
-    parsed_valid_ds = raw_valid_ds.map(trainer_data.parse_tfrecord_fn) # _data
-    parsed_padded_valid_ds = parsed_valid_ds.map(trainer_data.return_padded_tensors) # _data
+    # raw_valid_ds = tf.data.TFRecordDataset(valid_files)
+    # parsed_valid_ds = raw_valid_ds.map(trainer_data.parse_tfrecord) # _data
+    # parsed_padded_valid_ds = parsed_valid_ds.map(trainer_data.return_padded_tensors) # _data
+    
+    # OPTIMIZE DATA INPUT PIPELINE
+    valid_dataset = tf.data.Dataset.from_tensor_slices(valid_files)
+    valid_dataset = valid_dataset.interleave(
+        lambda x: tf.data.TFRecordDataset(x),
+        cycle_length=tf.data.AUTOTUNE, 
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False
+    ).map(
+        trainer_data.parse_tfrecord,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).map(
+        trainer_data.return_padded_tensors,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).batch(
+        args.batch_size * strategy.num_replicas_in_sync
+    ).prefetch(
+        tf.data.AUTOTUNE,
+    )
     
     # ====================================================
     # Parse candidates dataset
@@ -214,18 +224,18 @@ def main(args):
     # ====================================================
     # Prepare Train and Valid Data
     # ====================================================
-    logging.info(f'preparing train and valid splits...')
-    tf.random.set_seed(42)
+    # logging.info(f'preparing train and valid splits...')
+    # tf.random.set_seed(42)
     
     # TRAIN
-    shuffled_parsed_train_ds = parsed_padded_train_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
-    cached_train = shuffled_parsed_train_ds.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
+    # shuffled_parsed_train_ds = parsed_padded_train_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
+    # cached_train = shuffled_parsed_train_ds.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
     
     # VALID
     # shuffled_parsed_train_ds = parsed_padded_valid_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
-    cached_valid = parsed_padded_valid_ds.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
+    # cached_valid = parsed_padded_valid_ds.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
     
-    logging.info(f'TRAIN and VALID prepped...')
+    # logging.info(f'TRAIN and VALID prepped...')
 
     # train_data = shuffled_parsed_ds.take(80_000).batch(128)
     # valid_data = shuffled_parsed_ds.skip(80_000).take(20_000).batch(128)
@@ -291,7 +301,7 @@ def main(args):
 
         model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset)
         
-        model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_train_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: use cached_train or shuffled_parsed_train_ds ?
+        # model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_train_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: use cached_train or shuffled_parsed_train_ds ?
         # artist_name_can
         # track_name_can
         # album_name_can
@@ -302,12 +312,12 @@ def main(args):
             
         model.compile(optimizer=tf.keras.optimizers.Adagrad(args.learning_rate))
         
-    if cfg.NEW_ADAPTS:
-        vocab_dict_load['name'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-        bucket = storage_client.bucket(args.train_output_gcs_bucket)                               # TODO: args.train_output_gcs_bucket # replaced args.model_dir
-        blob = bucket.blob(f'{EXPERIMENT_NAME}/{RUN_NAME}/vocabs_stats/vocab_dict_{RUN_NAME}.txt') # replaced f'{args.version}/vocabs_stats/vocab_dict_{RUN_NAME}.txt'
-        pickle_out = pkl.dumps(vocab_dict_load)
-        blob.upload_from_string(pickle_out)
+    # if cfg.NEW_ADAPTS:
+        # vocab_dict_load['name'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
+        # bucket = storage_client.bucket(args.train_output_gcs_bucket)                               # TODO: args.train_output_gcs_bucket # replaced args.model_dir
+        # blob = bucket.blob(f'{EXPERIMENT_NAME}/{RUN_NAME}/vocabs_stats/vocab_dict_{RUN_NAME}.txt') # replaced f'{args.version}/vocabs_stats/vocab_dict_{RUN_NAME}.txt'
+        # pickle_out = pkl.dumps(vocab_dict_load)
+        # blob.upload_from_string(pickle_out)
     
     logging.info('Adapts finish - training next')
         
@@ -317,12 +327,15 @@ def main(args):
     AIP_LOGS = os.environ.get('AIP_TENSORBOARD_LOG_DIR', f'{logs_dir}')
     logging.info(f'TensorBoard logdir: {AIP_LOGS}')
     
+    cloud_profiler.init()
+    
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
         log_dir=AIP_LOGS,
         histogram_freq=0, 
         write_graph=True, 
-        profile_batch = '500,520'
+        # profile_batch = '500,520'
     )
+    
     # if os.environ.get('AIP_TENSORBOARD_LOG_DIR', 'NA') is not 'NA':
     #     tensorboard_callback = tf.keras.callbacks.TensorBoard(
     #         log_dir=os.environ['AIP_TENSORBOARD_LOG_DIR'],
@@ -335,12 +348,12 @@ def main(args):
         
     logging.info('Training starting')
     layer_history = model.fit(
-        cached_train,
-        validation_data=cached_valid,
+        train_dataset,
+        validation_data=valid_dataset,
         validation_freq=args.valid_frequency,
         callbacks=tensorboard_callback,
         epochs=args.num_epochs,
-        verbose=2
+        verbose=1
     )
     
     # Determine type and task of the machine from the strategy cluster resolver
@@ -355,7 +368,11 @@ def main(args):
     # ====================================================
     logging.info('Getting evaluation metrics')
 
-    val_metrics = model.evaluate(cached_valid, return_dict=True) #check performance
+    val_metrics = model.evaluate(
+        valid_dataset,
+        verbose="auto",
+        return_dict=True
+    ) #check performance
     
     logging.info('Validation metrics below:')
     logging.info(val_metrics)
