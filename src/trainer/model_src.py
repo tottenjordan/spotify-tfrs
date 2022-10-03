@@ -29,7 +29,7 @@ TOKEN_DICT = cfg.TOKEN_DICT             # '20000_tokens'
 # TOKEN_DICT = '20000_tokens'
 
 class Playlist_Model(tf.keras.Model):
-    def __init__(self, layer_sizes, vocab_dict):
+    def __init__(self, layer_sizes, vocab_dict): #, max_padding_len):
         super().__init__()
 
         # ========================================
@@ -641,16 +641,16 @@ class Candidate_Track_Model(tf.keras.Model):
 # ====================================================
 class TheTwoTowers(tfrs.models.Model):
 
-    def __init__(self, layer_sizes, vocab_dict_load, parsed_candidate_dataset):
+    def __init__(self, layer_sizes, vocab_dict_load, parsed_candidate_dataset): # , max_padding_len):
         super().__init__()
         
-        self.query_tower = Playlist_Model(layer_sizes, vocab_dict_load)
+        self.query_tower = Playlist_Model(layer_sizes, vocab_dict_load) #, max_padding_len)
         
         self.candidate_tower = Candidate_Track_Model(layer_sizes, vocab_dict_load)
         
         self.task = tfrs.tasks.Retrieval(
             metrics=tfrs.metrics.FactorizedTopK(
-                candidates=parsed_candidate_dataset.batch(128).cache().map(self.candidate_tower)
+                candidates=parsed_candidate_dataset.batch(128).map(self.candidate_tower)
             )
         )
         

@@ -7,7 +7,7 @@ USE_DROPOUT = 'True'
 
 SEED = 1234
 
-MAX_PADDING = 375
+MAX_PADDING = 5 # this should improve performance vs 375
 
 EMBEDDING_DIM = 32
 PROJECTION_DIM = 5

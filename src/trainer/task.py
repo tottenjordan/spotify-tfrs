@@ -16,8 +16,6 @@ from google.cloud import storage
 import hypertune
 from google.cloud.aiplatform.training_utils import cloud_profiler
 
-
-import time
 import numpy as np
 
 # ====================================================
@@ -38,16 +36,17 @@ def get_arch_from_string(arch_string):
 # ====================================================
 # Main
 # ====================================================
-import _data as trainer_data
-import _model as trainer_model
+import data_src as trainer_data
+import model_src as trainer_model
 import train_config as cfg
-import time 
+import time
 
 TIMESTAMP = time.strftime("%Y%m%d-%H%M%S")
 
 def main(args):
     
-    tf.debugging.set_log_device_placement(True)
+    # tf.debugging.set_log_device_placement(True) # logs all tf ops and their device placement;
+    TF_GPU_THREAD_MODE='gpu_private'
     
     logging.info("Starting training...")
     logging.info('TF_CONFIG = {}'.format(os.environ.get('TF_CONFIG', 'Not found')))
@@ -61,15 +60,6 @@ def main(args):
     
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    
-    TF_GPU_THREAD_MODE='gpu_private'
-    
-    # Mixed Precision
-    # logging.info(f'Setting Mixed Precision policy...')
-    # policy = mixed_precision.Policy('mixed_float16')
-    # mixed_precision.set_global_policy(policy)
-    # logging.info('Compute dtype: %s' % policy.compute_dtype)
-    # logging.info('Variable dtype: %s' % policy.variable_dtype)
     
     # AIP_TB_LOGS = args.aip_tb_logs # os.environ.get('AIP_TENSORBOARD_LOG_DIR', 'NA')
     # logging.info(f'AIP TENSORBOARD LOG DIR: {AIP_TB_LOGS}')
@@ -134,9 +124,6 @@ def main(args):
     # ====================================================
     # TRAIN dataset - Parse & Pad
     # ====================================================
-
-    # logging.info(f'Getting train data from bucket: {args.train_dir}')
-    # logging.info(f'args.train_dir_prefix: {args.train_dir_prefix}')
     
     logging.info(f'Path to TRAIN files: gs://{args.train_dir}/{args.train_dir_prefix}')
     
@@ -155,14 +142,14 @@ def main(args):
         lambda x: tf.data.TFRecordDataset(x),
         cycle_length=tf.data.AUTOTUNE, 
         num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False
+        deterministic=False,
     ).map(
         trainer_data.parse_tfrecord,
         num_parallel_calls=tf.data.AUTOTUNE,
-    ).map(
-        trainer_data.return_padded_tensors,
+          ).map(
+        trainer_data.return_padded_tensors, #(max_playlist_len=args.max_padding),
         num_parallel_calls=tf.data.AUTOTUNE,
-    ).batch(
+          ).batch(
         args.batch_size * strategy.num_replicas_in_sync
     ).prefetch(
         tf.data.AUTOTUNE,
@@ -171,9 +158,6 @@ def main(args):
     # ====================================================
     # VALID dataset - Parse & Pad 
     # ====================================================
-    
-    # logging.info(f'args.valid_dir: {args.valid_dir}')                   # TODO: args.valid_dir
-    # logging.info(f'args.valid_dir_prefix: {args.valid_dir_prefix}')     # TODO: args.valid_dir_prefix
     
     logging.info(f'Path to VALID files: gs://{args.valid_dir}/{args.valid_dir_prefix}')
     
@@ -192,14 +176,14 @@ def main(args):
         lambda x: tf.data.TFRecordDataset(x),
         cycle_length=tf.data.AUTOTUNE, 
         num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False
+        deterministic=False,
     ).map(
         trainer_data.parse_tfrecord,
         num_parallel_calls=tf.data.AUTOTUNE,
-    ).map(
-        trainer_data.return_padded_tensors,
+          ).map(
+        trainer_data.return_padded_tensors, #(max_playlist_len=args.max_padding),
         num_parallel_calls=tf.data.AUTOTUNE,
-    ).batch(
+          ).batch(
         args.batch_size * strategy.num_replicas_in_sync
     ).prefetch(
         tf.data.AUTOTUNE,
@@ -208,9 +192,6 @@ def main(args):
     # ====================================================
     # Parse candidates dataset
     # ====================================================
-
-    # logging.info(f'args.candidate_file_dir: {args.candidate_file_dir}')
-    # logging.info(f'args.candidate_files_prefix: {args.candidate_files_prefix}')
     
     logging.info(f'Path to CANDIDATE files: gs://{args.candidate_file_dir}/{args.candidate_files_prefix}')
 
@@ -218,33 +199,22 @@ def main(args):
     for blob in storage_client.list_blobs(f'{args.candidate_file_dir}', prefix=f'{args.candidate_files_prefix}', delimiter="/"):
         candidate_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
         
-    raw_candidate_dataset = tf.data.TFRecordDataset(candidate_files)
-    parsed_candidate_dataset = raw_candidate_dataset.map(trainer_data.parse_candidate_tfrecord_fn) # _data
+    # raw_candidate_dataset = tf.data.TFRecordDataset(candidate_files)
+    # parsed_candidate_dataset = raw_candidate_dataset.map(trainer_data.parse_candidate_tfrecord_fn) # _data
     
-    # ====================================================
-    # Prepare Train and Valid Data
-    # ====================================================
-    # logging.info(f'preparing train and valid splits...')
-    # tf.random.set_seed(42)
-    
-    # TRAIN
-    # shuffled_parsed_train_ds = parsed_padded_train_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
-    # cached_train = shuffled_parsed_train_ds.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
-    
-    # VALID
-    # shuffled_parsed_train_ds = parsed_padded_valid_ds.shuffle(10_000, seed=42, reshuffle_each_iteration=False)
-    # cached_valid = parsed_padded_valid_ds.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
-    
-    # logging.info(f'TRAIN and VALID prepped...')
-
-    # train_data = shuffled_parsed_ds.take(80_000).batch(128)
-    # valid_data = shuffled_parsed_ds.skip(80_000).take(20_000).batch(128)
-    
-    # valid_size = 20_000 # cfg.VALID_SIZE # 20_000 # args.valid_size
-    # valid = shuffled_parsed_ds.take(valid_size)
-    # train = shuffled_parsed_ds.skip(valid_size)
-    # cached_train = train.batch(args.batch_size * strategy.num_replicas_in_sync).prefetch(tf.data.AUTOTUNE)
-    # cached_valid = valid.batch(args.batch_size * strategy.num_replicas_in_sync).cache().prefetch(tf.data.AUTOTUNE)
+    #generate the candidate dataset
+    candidate_dataset = tf.data.Dataset.from_tensor_slices(candidate_files)
+    parsed_candidate_dataset = candidate_dataset.interleave(
+        lambda x: tf.data.TFRecordDataset(x),
+        cycle_length=tf.data.AUTOTUNE, 
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    ).map(
+        trainer_data.parse_candidate_tfrecord_fn,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).prefetch(
+        tf.data.AUTOTUNE,
+    )
     
     # ====================================================
     # metaparams for Vertex Ai Experiments
@@ -272,6 +242,7 @@ def main(args):
     hyperparams["use_dropout"] = cfg.USE_DROPOUT # args.use_dropout
     hyperparams["dropout_rate"] = args.dropout_rate
     hyperparams['layer_sizes'] = args.layer_sizes
+    hyperparams['max_padding'] = args.max_padding
     
     logging.info(f"Creating run: {RUN_NAME}; for experiment: {EXPERIMENT_NAME}")
     
@@ -299,7 +270,7 @@ def main(args):
     # Wrap variable creation within strategy scope
     with strategy.scope():
 
-        model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset)
+        model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset) #, max_padding_len=args.max_padding)
         
         # model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_train_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: use cached_train or shuffled_parsed_train_ds ?
         # artist_name_can
@@ -345,41 +316,100 @@ def main(args):
     #     tensorboard_callback = tf.keras.callbacks.TensorBoard(
     #         log_dir='/tb_logs',
     #         histogram_freq=0)
-        
+    
     logging.info('Training starting')
+    start_model_fit = time.time()
+    
     layer_history = model.fit(
         train_dataset,
-        validation_data=valid_dataset,
-        validation_freq=args.valid_frequency,
+        # validation_data=valid_dataset,
+        # validation_freq=args.valid_frequency, # no longer used due to long-running brute force see scann validation belo
         callbacks=tensorboard_callback,
+        # steps_per_epoch=10, #for debugging purposes
         epochs=args.num_epochs,
         verbose=1
     )
     
+    # capture elapsed time
+    end_model_fit = time.time()
+    elapsed_model_fit = end_model_fit - start_model_fit
+    elapsed_model_fit = round(elapsed_model_fit, 2)
+    logging.info(f'Elapsed model_fit: {elapsed_model_fit} seconds')
+
     # Determine type and task of the machine from the strategy cluster resolver
     if args.distribute == 'multiworker':
         task_type, task_id = (strategy.cluster_resolver.task_type,
                               strategy.cluster_resolver.task_id)
     else:
         task_type, task_id = None, None
+        
+    # ====================================================
+    # Aprroximate Validation with ScaNN
+    # ====================================================
+    # Get candidate item (songs/tracks) embeddings
+    song_embeddings = parsed_candidate_dataset.batch(2048).map(
+        model.candidate_tower, 
+        num_parallel_calls=tf.data.AUTOTUNE
+    ).prefetch(
+        tf.data.AUTOTUNE
+    )
     
+    logging.info("Creating ScaNN layer for approximate validation metrics")
+    start_scann_layer = time.time()
+    
+    # Compute predictions
+    scann = tfrs.layers.factorized_top_k.ScaNN(
+        num_reordering_candidates=500,         # TODO: parameterize
+        num_leaves_to_search=30                # TODO: parameterize
+    )
+    scann.index_from_dataset(song_embeddings)
+    
+    with strategy.scope():
+        model.task.factorized_metrics = tfrs.metrics.FactorizedTopK(
+            candidates=scann
+        )
+        model.compile()
+    
+    # capture elapsed time
+    end_scann_layer = time.time()
+    elapsed_scann_layer = end_scann_layer - start_scann_layer
+    elapsed_scann_layer = round(elapsed_scann_layer, 2)
+    logging.info(f'Elapsed ScaNN Layer: {elapsed_scann_layer} seconds')
+    
+    logging.info("custom scann layer generation for validation complete")
+    #TODO - perhaps output the scann layer for indexing use if needed
+
     # ====================================================
     # Eval Metrics
     # ====================================================
     logging.info('Getting evaluation metrics')
-
+    start_evaluation = time.time()
+    
     val_metrics = model.evaluate(
         valid_dataset,
         verbose="auto",
-        return_dict=True
+        return_dict=True,
+        callbacks=tensorboard_callback,
     ) #check performance
     
+    # capture elapsed time
+    end_evaluation = time.time()
+    elapsed_evaluation = end_evaluation - start_evaluation
+    elapsed_evaluation = round(elapsed_evaluation, 2)
+    logging.info(f'Elapsed model Evaluation: {elapsed_evaluation} seconds')
+
     logging.info('Validation metrics below:')
     logging.info(val_metrics)
+    
+    time_metrics = {}
+    time_metrics["elapsed_model_fit"] = elapsed_model_fit
+    time_metrics["elapsed_scann_layer"] = elapsed_scann_layer
+    time_metrics["elapsed_evaluation"] = elapsed_evaluation
     
     with vertex_ai.start_run(RUN_NAME,resume=True) as my_run:
         logging.info(f"logging metrics to experiment run {RUN_NAME}")
         my_run.log_metrics(val_metrics)
+        my_run.log_metrics(time_metrics)
     
     # logging.info(f"Ending experiment run: {RUN_NAME}")
     # vertex_ai.end_run()
@@ -388,7 +418,6 @@ def main(args):
     # Save Towers
     # ====================================================
     
-    # logging.info(f'Saving models to {args.model_dir}')                                        # TODO: f'gs://args.train_output_gcs_bucket/{EXPERIMENT_NAME}/{RUN_NAME}/model-dir
     MODEL_DIR_GCS_URI = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/model-dir'
     logging.info(f'Saving models to {MODEL_DIR_GCS_URI}')
 

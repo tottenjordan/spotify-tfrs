@@ -1,5 +1,5 @@
 
-FROM tensorflow/tensorflow:2.9.2-gpu
+FROM tensorflow/tensorflow:2.8.2-gpu
 
 WORKDIR /src
 
