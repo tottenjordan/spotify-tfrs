@@ -25,7 +25,13 @@ import numpy as np
 def _is_chief(task_type, task_id): 
     ''' Check for primary if multiworker training
     '''
-    return (task_type == 'chief') or (task_type == 'worker' and task_id == 0) or task_type is None
+    if task_type == 'chief':
+        results = 'chief'
+    else:
+        results = None
+    return results
+    # return (task_type == 'chief') or (task_type == 'worker' and task_id == 0) or task_type is None
+    # return ((task_type == 'chief' and task_id == 0) or task_type is None)
 
 def get_arch_from_string(arch_string):
     q = arch_string.replace(']', '')
@@ -49,7 +55,7 @@ def main(args):
     TF_GPU_THREAD_MODE='gpu_private'
     
     logging.info("Starting training...")
-    logging.info('TF_CONFIG = {}'.format(os.environ.get('TF_CONFIG', 'Not found')))
+    # logging.info('TF_CONFIG = {}'.format(os.environ.get('TF_CONFIG', 'Not found')))
     
     storage_client = storage.Client(
         project=args.project
@@ -57,12 +63,6 @@ def main(args):
     
     WORKING_DIR = f'gs://{args.train_output_gcs_bucket}'             # replaced f'gs://{args.model_dir}/{args.version}'
     logging.info(f'Train job output directory: {WORKING_DIR}')
-    
-    options = tf.data.Options()
-    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    
-    # AIP_TB_LOGS = args.aip_tb_logs # os.environ.get('AIP_TENSORBOARD_LOG_DIR', 'NA')
-    # logging.info(f'AIP TENSORBOARD LOG DIR: {AIP_TB_LOGS}')
     
     # ====================================================
     # Set Device / GPU/TPU Strategy
@@ -77,19 +77,16 @@ def main(args):
             strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
         else:
             strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
-        logging.info("Single device training")
-    
+        logging.info("Single device training")  
     # Single Machine, multiple compute device
     elif args.distribute == 'mirrored':
         strategy = tf.distribute.MirroredStrategy()
         logging.info("Mirrored Strategy distributed training")
-
     # Multi Machine, multiple compute device
     elif args.distribute == 'multiworker':
         strategy = tf.distribute.MultiWorkerMirroredStrategy()
         logging.info("Multi-worker Strategy distributed training")
         logging.info('TF_CONFIG = {}'.format(os.environ.get('TF_CONFIG', 'Not found')))
-    
     # Single Machine, multiple TPU devices
     elif args.distribute == 'tpu':
         cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu="local")
@@ -98,10 +95,28 @@ def main(args):
         strategy = tf.distribute.TPUStrategy(cluster_resolver)
         logging.info("All devices: ", tf.config.list_logical_devices('TPU'))
 
+    logging.info(f'TF training strategy = {strategy}')
     
-    logging.info('num_replicas_in_sync = {}'.format(strategy.num_replicas_in_sync))
     NUM_REPLICAS = strategy.num_replicas_in_sync
+    logging.info(f'num_replicas_in_sync = {NUM_REPLICAS}')
+
     
+    # TODO: Determine type and task of the machine from the strategy cluster resolver
+    logging.info(f'Setting task_type and task_id...')
+    # task_type, task_id = (
+    #     strategy.cluster_resolver.task_type,
+    #     strategy.cluster_resolver.task_id
+    # )
+    if args.distribute == 'multiworker':
+        task_type, task_id = (
+            strategy.cluster_resolver.task_type,
+            strategy.cluster_resolver.task_id
+        )
+    else:
+        task_type, task_id = 'chief', None
+    
+    logging.info(f'task_type = {task_type}')
+    logging.info(f'task_id = {task_id}')
     # ====================================================
     # Vocab Files
     # ====================================================
@@ -125,16 +140,14 @@ def main(args):
     # TRAIN dataset - Parse & Pad
     # ====================================================
     
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.AUTO
+    
     logging.info(f'Path to TRAIN files: gs://{args.train_dir}/{args.train_dir_prefix}')
     
     train_files = []
     for blob in storage_client.list_blobs(f'{args.train_dir}', prefix=f'{args.train_dir_prefix}', delimiter="/"):
         train_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
-        
-    # Parse train dataset
-    # raw_train_ds = tf.data.TFRecordDataset(train_files)
-    # parsed_train_ds = raw_train_ds.map(trainer_data.parse_tfrecord) # _data
-    # parsed_padded_train_ds = parsed_train_ds.map(trainer_data.return_padded_tensors) # _data
     
     # OPTIMIZE DATA INPUT PIPELINE
     train_dataset = tf.data.Dataset.from_tensor_slices(train_files)
@@ -153,7 +166,7 @@ def main(args):
         args.batch_size * strategy.num_replicas_in_sync
     ).prefetch(
         tf.data.AUTOTUNE,
-    )
+    ).with_options(options)
     
     # ====================================================
     # VALID dataset - Parse & Pad 
@@ -164,11 +177,6 @@ def main(args):
     valid_files = []
     for blob in storage_client.list_blobs(f'{args.valid_dir}', prefix=f'{args.valid_dir_prefix}', delimiter="/"):
         valid_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
-        
-    # Parse train dataset
-    # raw_valid_ds = tf.data.TFRecordDataset(valid_files)
-    # parsed_valid_ds = raw_valid_ds.map(trainer_data.parse_tfrecord) # _data
-    # parsed_padded_valid_ds = parsed_valid_ds.map(trainer_data.return_padded_tensors) # _data
     
     # OPTIMIZE DATA INPUT PIPELINE
     valid_dataset = tf.data.Dataset.from_tensor_slices(valid_files)
@@ -187,7 +195,7 @@ def main(args):
         args.batch_size * strategy.num_replicas_in_sync
     ).prefetch(
         tf.data.AUTOTUNE,
-    )
+    ).with_options(options)
     
     # ====================================================
     # Parse candidates dataset
@@ -198,9 +206,6 @@ def main(args):
     candidate_files = []
     for blob in storage_client.list_blobs(f'{args.candidate_file_dir}', prefix=f'{args.candidate_files_prefix}', delimiter="/"):
         candidate_files.append(blob.public_url.replace("https://storage.googleapis.com/", "gs://"))
-        
-    # raw_candidate_dataset = tf.data.TFRecordDataset(candidate_files)
-    # parsed_candidate_dataset = raw_candidate_dataset.map(trainer_data.parse_candidate_tfrecord_fn) # _data
     
     #generate the candidate dataset
     candidate_dataset = tf.data.Dataset.from_tensor_slices(candidate_files)
@@ -214,7 +219,7 @@ def main(args):
         num_parallel_calls=tf.data.AUTOTUNE,
     ).prefetch(
         tf.data.AUTOTUNE,
-    )
+    ).with_options(options)
     
     # ====================================================
     # metaparams for Vertex Ai Experiments
@@ -250,12 +255,23 @@ def main(args):
     vertex_ai.init(experiment=EXPERIMENT_NAME)
     # vertex_ai.start_run(RUN_NAME,resume=True) # RUN_NAME
     
-    with vertex_ai.start_run(RUN_NAME) as my_run:
-        logging.info(f"logging metaparams")
-        my_run.log_params(metaparams)
+#     with vertex_ai.start_run(RUN_NAME) as my_run:
+#         logging.info(f"logging metaparams")
+#         my_run.log_params(metaparams)
         
-        logging.info(f"logging hyperparams")
-        my_run.log_params(hyperparams)
+#         logging.info(f"logging hyperparams")
+#         my_run.log_params(hyperparams)
+        
+    # if _is_chief(task_type, task_id):
+    if task_type == 'chief':
+        logging.info(f"_is_chief task_type:{task_type}")
+        logging.info(f"_is_chief task_id:{task_id}")
+        with vertex_ai.start_run(RUN_NAME) as my_run:
+            logging.info(f"logging metaparams")
+            my_run.log_params(metaparams)
+            
+            logging.info(f"logging hyperparams")
+            my_run.log_params(hyperparams)
         
     # ====================================================
     # Compile, Adapt, and Train model
@@ -335,13 +351,6 @@ def main(args):
     elapsed_model_fit = end_model_fit - start_model_fit
     elapsed_model_fit = round(elapsed_model_fit, 2)
     logging.info(f'Elapsed model_fit: {elapsed_model_fit} seconds')
-
-    # Determine type and task of the machine from the strategy cluster resolver
-    if args.distribute == 'multiworker':
-        task_type, task_id = (strategy.cluster_resolver.task_type,
-                              strategy.cluster_resolver.task_id)
-    else:
-        task_type, task_id = None, None
         
     # ====================================================
     # Aprroximate Validation with ScaNN
@@ -352,19 +361,20 @@ def main(args):
         num_parallel_calls=tf.data.AUTOTUNE
     ).prefetch(
         tf.data.AUTOTUNE
-    )
+    ).with_options(options)
     
     logging.info("Creating ScaNN layer for approximate validation metrics")
     start_scann_layer = time.time()
     
     # Compute predictions
-    scann = tfrs.layers.factorized_top_k.ScaNN(
-        num_reordering_candidates=500,         # TODO: parameterize
-        num_leaves_to_search=30                # TODO: parameterize
-    )
-    scann.index_from_dataset(song_embeddings)
-    
     with strategy.scope():
+        scann = tfrs.layers.factorized_top_k.ScaNN(
+            num_reordering_candidates=500,         # TODO: parameterize
+            num_leaves_to_search=30                # TODO: parameterize
+        )
+        scann.index_from_dataset(song_embeddings)
+    
+    # with strategy.scope():
         model.task.factorized_metrics = tfrs.metrics.FactorizedTopK(
             candidates=scann
         )
@@ -406,10 +416,13 @@ def main(args):
     time_metrics["elapsed_scann_layer"] = elapsed_scann_layer
     time_metrics["elapsed_evaluation"] = elapsed_evaluation
     
-    with vertex_ai.start_run(RUN_NAME,resume=True) as my_run:
-        logging.info(f"logging metrics to experiment run {RUN_NAME}")
-        my_run.log_metrics(val_metrics)
-        my_run.log_metrics(time_metrics)
+    
+    # if _is_chief(task_type, task_id):
+    if task_type == 'chief':
+        with vertex_ai.start_run(RUN_NAME,resume=True) as my_run:
+            logging.info(f"logging metrics to experiment run {RUN_NAME}")
+            my_run.log_metrics(val_metrics)
+            my_run.log_metrics(time_metrics)
     
     # logging.info(f"Ending experiment run: {RUN_NAME}")
     # vertex_ai.end_run()
@@ -426,7 +439,8 @@ def main(args):
     logging.info(f'Saving chief query model to {query_dir_save}')
     
     # save model from primary node in multiworker
-    if _is_chief(task_type, task_id):
+    # if _is_chief(task_type, task_id):
+    if task_type == 'chief':
         tf.saved_model.save(model.query_tower, query_dir_save)
         logging.info(f'Saved chief query model to {query_dir_save}')
         tf.saved_model.save(model.candidate_tower, candidate_dir_save)
@@ -442,7 +456,8 @@ def main(args):
         tf.saved_model.save(model.candidate_tower, worker_dir_can)
         logging.info(f'Saved worker: {task_id} candidate model to {worker_dir_can}')
 
-    if not _is_chief(task_type, task_id):
+    # if not _is_chief(task_type, task_id):
+    if task_type != 'chief':
         tf.io.gfile.rmtree(worker_dir_can)
         tf.io.gfile.rmtree(worker_dir_query)
 
