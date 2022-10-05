@@ -51,21 +51,29 @@ TIMESTAMP = time.strftime("%Y%m%d-%H%M%S")
 
 def main(args):
     
+    # limiting GPU growth
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logging.info(f'detected: {len(gpus)} GPUs')
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            logging.info(e)
+                
     # tf.debugging.set_log_device_placement(True) # logs all tf ops and their device placement;
-    TF_GPU_THREAD_MODE='gpu_private'
-    
-    logging.info("Starting training...")
-    # logging.info('TF_CONFIG = {}'.format(os.environ.get('TF_CONFIG', 'Not found')))
+    # TF_GPU_THREAD_MODE='gpu_private'
+    os.environ['TF_GPU_THREAD_MODE']='gpu_private'
+    os.environ['TF_GPU_THREAD_COUNT']='1'
+    os.environ['TF_GPU_ALLOCATOR']='cuda_malloc_async'
     
     storage_client = storage.Client(
         project=args.project
     )
     
-    WORKING_DIR = f'gs://{args.train_output_gcs_bucket}'             # replaced f'gs://{args.model_dir}/{args.version}'
-    logging.info(f'Train job output directory: {WORKING_DIR}')
-    
     # ====================================================
-    # Set Device / GPU/TPU Strategy
+    # Set Device Strategy
     # ====================================================
     logging.info("Detecting devices....")
     logging.info(f'Detected Devices {str(device_lib.list_local_devices())}')
@@ -82,6 +90,9 @@ def main(args):
     elif args.distribute == 'mirrored':
         strategy = tf.distribute.MirroredStrategy()
         logging.info("Mirrored Strategy distributed training")
+        gpus = tf.config.list_physical_devices('GPU')
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
     # Multi Machine, multiple compute device
     elif args.distribute == 'multiworker':
         strategy = tf.distribute.MultiWorkerMirroredStrategy()
@@ -99,8 +110,12 @@ def main(args):
     
     NUM_REPLICAS = strategy.num_replicas_in_sync
     logging.info(f'num_replicas_in_sync = {NUM_REPLICAS}')
-
     
+    # Here the batch size scales up by number of workers since
+    # `tf.data.Dataset.batch` expects the global batch size.
+    GLOBAL_BATCH_SIZE = args.batch_size * NUM_REPLICAS
+    logging.info(f'GLOBAL_BATCH_SIZE = {GLOBAL_BATCH_SIZE}')
+
     # TODO: Determine type and task of the machine from the strategy cluster resolver
     logging.info(f'Setting task_type and task_id...')
     # task_type, task_id = (
@@ -123,8 +138,8 @@ def main(args):
 
     # TODO: parameterize & configure for adapts vs vocab files
 
-    BUCKET_NAME = 'spotify-v1'                           # args.vocab_gcs_bucket
-    FILE_PATH = 'vocabs/v2_string_vocabs'                # args.vocab_gcs_file_path
+    BUCKET_NAME = 'spotify-v1'                             # args.vocab_gcs_bucket
+    FILE_PATH = 'vocabs/v2_string_vocabs'                  # args.vocab_gcs_file_path
     FILE_NAME = 'string_vocabs_v1_20220924-tokens22.pkl'   # args.vocab_filename
     DESTINATION_FILE = 'downloaded_vocabs.txt'     
 
@@ -141,7 +156,8 @@ def main(args):
     # ====================================================
     
     options = tf.data.Options()
-    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.AUTO
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.AUTO # FILE | DATA | AUTO
+    # options.experimental_optimization.map_and_batch_fusion = False
     
     logging.info(f'Path to TRAIN files: gs://{args.train_dir}/{args.train_dir_prefix}')
     
@@ -151,6 +167,8 @@ def main(args):
     
     # OPTIMIZE DATA INPUT PIPELINE
     train_dataset = tf.data.Dataset.from_tensor_slices(train_files)
+    # train_dataset = tf.data.Dataset.list_files(train_files)
+    # train_dataset = train_dataset.shard(num_shards=NUM_REPLICAS, index=REPLICA_ID).repeat(args.num_epochs)
     train_dataset = train_dataset.interleave(
         lambda x: tf.data.TFRecordDataset(x),
         cycle_length=tf.data.AUTOTUNE, 
@@ -163,7 +181,7 @@ def main(args):
         trainer_data.return_padded_tensors, #(max_playlist_len=args.max_padding),
         num_parallel_calls=tf.data.AUTOTUNE,
           ).batch(
-        args.batch_size * strategy.num_replicas_in_sync
+        args.batch_size * strategy.num_replicas_in_sync   # GLOBAL_BATCH_SIZE
     ).prefetch(
         tf.data.AUTOTUNE,
     ).with_options(options)
@@ -180,6 +198,7 @@ def main(args):
     
     # OPTIMIZE DATA INPUT PIPELINE
     valid_dataset = tf.data.Dataset.from_tensor_slices(valid_files)
+    # valid_dataset = tf.data.Dataset.list_files(valid_files)
     valid_dataset = valid_dataset.interleave(
         lambda x: tf.data.TFRecordDataset(x),
         cycle_length=tf.data.AUTOTUNE, 
@@ -192,7 +211,7 @@ def main(args):
         trainer_data.return_padded_tensors, #(max_playlist_len=args.max_padding),
         num_parallel_calls=tf.data.AUTOTUNE,
           ).batch(
-        args.batch_size * strategy.num_replicas_in_sync
+        args.batch_size * strategy.num_replicas_in_sync   # GLOBAL_BATCH_SIZE
     ).prefetch(
         tf.data.AUTOTUNE,
     ).with_options(options)
@@ -224,15 +243,176 @@ def main(args):
     # ====================================================
     # metaparams for Vertex Ai Experiments
     # ====================================================
-    logging.info('Logging metaparams & hyperparams for Vertex Experiments')
+#     logging.info('Logging metaparams & hyperparams for Vertex Experiments')
     
     EXPERIMENT_NAME = f"{args.experiment_name}"
-    RUN_NAME = f"{args.experiment_run}"
-    logging.info(f"EXPERIMENT_NAME: {EXPERIMENT_NAME}\n RUN_NAME: {RUN_NAME}")
+    # EXPERIMENT_DESCRIPTION = f"vertex ai experiment runs for model_version: {args.model_version}"
+    EXPERIMENT_TENSORBOARD = f"{args.experiment_tb}"
+    RUN_NAME = f"{args.experiment_run}-{TIMESTAMP}"
+    
+    # BASE_OUTPUT_DIR = f'gs://{OUTPUT_BUCKET}/{EXPERIMENT_NAME}/{RUN_NAME_PREFIX}' # gcs path submitted to vertex job
+    WORKING_DIR_GCS_URI = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}' 
+    
+    logging.info(f"EXPERIMENT_NAME: {EXPERIMENT_NAME}")
+    # logging.info(f"EXPERIMENT_DESCRIPTION: {EXPERIMENT_DESCRIPTION}")
+    logging.info(f"EXPERIMENT_TENSORBOARD: {EXPERIMENT_TENSORBOARD}")
+    logging.info(f"RUN_NAME: {RUN_NAME}")
+    logging.info(f'Train job output directory: {WORKING_DIR_GCS_URI}') 
+
+    # # Create experiment
+    vertex_ai.init(
+        experiment=EXPERIMENT_NAME,
+        # experiment_description=EXPERIMENT_DESCRIPTION,
+        # experiment_tensorboard=EXPERIMENT_TENSORBOARD,
+        # project=args.project,
+    )
+        
+    # ====================================================
+    # Compile, Adapt, and Train model
+    # ====================================================
+    logging.info('Setting model adapts and compiling the model')
+    
+    LAYER_SIZES = get_arch_from_string(args.layer_sizes)
+    logging.info(f'LAYER_SIZES: {LAYER_SIZES}')
+
+    # if task_type == 'chief':
+    #     logging.info(f" initializing experiment run: {RUN_NAME}")
+    #     with vertex_ai.start_run(RUN_NAME) as my_run:
+    #         vertex_ai.start_run(run=f"{RUN_NAME}", tensorboard=EXPERIMENT_TENSORBOARD)
+    
+    # Wrap variable creation within strategy scope
+    with strategy.scope():
+
+        model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset) #, max_padding_len=args.max_padding)
+            
+        model.compile(optimizer=tf.keras.optimizers.Adagrad(args.learning_rate))
+    
+    logging.info('model compiled...')
+        
+    tf.random.set_seed(args.seed)
+    
+    # logs_dir = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/tb-logs'
+    logs_dir = f'{WORKING_DIR_GCS_URI}/tb-logs'
+    # AIP_LOGS = os.environ.get('AIP_TENSORBOARD_LOG_DIR', f'{logs_dir}')
+    logging.info(f'TensorBoard logdir: {logs_dir}')
+    
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir=logs_dir,
+        histogram_freq=0, 
+        write_graph=True, 
+        # profile_batch = '500,520'
+    )
+    
+    cloud_profiler.init()
+    
+    logging.info('Starting training loop...')
+    start_model_fit = time.time()
+    
+    layer_history = model.fit(
+        train_dataset,
+        validation_data=valid_dataset,
+        validation_freq=args.valid_frequency,
+        callbacks=tensorboard_callback,
+        # steps_per_epoch=10, #for debugging purposes
+        epochs=args.num_epochs,
+        verbose=1
+    )
+    
+    # capture elapsed time
+    end_model_fit = time.time()
+    elapsed_model_fit = end_model_fit - start_model_fit
+    elapsed_model_fit = round(elapsed_model_fit, 2)
+    logging.info(f'Elapsed model_fit: {elapsed_model_fit} seconds')
+    
+    # Log additional parameters
+    # if task_type == 'chief':
+    #     logging.info(f" logging layer_history.params: {layer_history.params}")
+    #     vertex_ai.log_params(layer_history.params)
+            
+        # # TODO: Log metrics per epochs with `layer_history.params`
+        # for idx in range(0, history.params["epochs"]):
+        #     vertex_ai.log_time_series_metrics(
+        #         {
+        #             "train_mae": history.history["mae"][idx],
+        #             "train_mse": history.history["mse"][idx],
+        #         }
+        #     )
+        
+#     # ====================================================
+#     # Aprroximate Validation with ScaNN
+#     # ====================================================
+#     # Get candidate item (songs/tracks) embeddings
+#     song_embeddings = parsed_candidate_dataset.batch(2048).map(            # 2048 | GLOBAL_BATCH_SIZE
+#         model.candidate_tower, 
+#         num_parallel_calls=tf.data.AUTOTUNE
+#     ).prefetch(
+#         tf.data.AUTOTUNE
+#     ).with_options(options)
+    
+#     logging.info("Creating ScaNN layer for approximate validation metrics")
+#     start_scann_layer = time.time()
+    
+#     # Compute predictions # TODO: parameterize
+#     # with strategy.scope():
+#     scann = tfrs.layers.factorized_top_k.ScaNN(
+#         num_reordering_candidates=500,
+#         num_leaves_to_search=30
+#     )
+#     scann.index_from_dataset(song_embeddings)
+
+#     model.task.factorized_metrics = tfrs.metrics.FactorizedTopK(
+#         candidates=scann
+#     )
+
+#     with strategy.scope():
+#         model.compile()
+        
+#     logging.info('model compiled...')
+    
+#     # capture elapsed time
+#     end_scann_layer = time.time()
+#     elapsed_scann_layer = end_scann_layer - start_scann_layer
+#     elapsed_scann_layer = round(elapsed_scann_layer, 2)
+#     logging.info(f'Elapsed ScaNN Layer: {elapsed_scann_layer} seconds')
+    
+#     logging.info("custom scann layer generation for validation complete")
+    #TODO - perhaps output the scann layer for indexing use if needed
+
+    # ====================================================
+    # Eval Metrics
+    # ====================================================
+    logging.info('Getting evaluation metrics...')
+    start_evaluation = time.time()
+    
+    val_metrics = model.evaluate(
+        valid_dataset,
+        verbose="auto",
+        return_dict=True,
+        callbacks=tensorboard_callback,
+    ) #check performance
+    
+    # capture elapsed time
+    end_evaluation = time.time()
+    elapsed_evaluation = end_evaluation - start_evaluation
+    elapsed_evaluation = round(elapsed_evaluation, 2)
+    logging.info(f'Elapsed model Evaluation: {elapsed_evaluation} seconds')
+
+    logging.info('Validation metrics:')
+    logging.info(val_metrics)
+    
+    # ====================================================
+    # metaparams for Vertex Ai Experiments
+    # ====================================================
+    logging.info('Logging metaparams, hyperparams, and metrics to Experiments')
+    
+    time_metrics = {}
+    time_metrics["elapsed_model_fit"] = elapsed_model_fit
+    # time_metrics["elapsed_scann_layer"] = elapsed_scann_layer
+    time_metrics["elapsed_evaluation"] = elapsed_evaluation
     
     metaparams = {}
-    metaparams["experiment_name"] = f'{EXPERIMENT_NAME}'
-    metaparams["experiment_run"] = f"{RUN_NAME}"
+    # metaparams["experiment_name"] = f'{EXPERIMENT_NAME}'
+    # metaparams["experiment_run"] = f"{RUN_NAME}"
     metaparams["model_version"] = f"{args.model_version}"
     metaparams["pipe_version"] = f"{args.pipeline_version}"
     metaparams["data_regime"] = f"{args.data_regime}"
@@ -249,180 +429,33 @@ def main(args):
     hyperparams['layer_sizes'] = args.layer_sizes
     hyperparams['max_padding'] = args.max_padding
     
-    logging.info(f"Creating run: {RUN_NAME}; for experiment: {EXPERIMENT_NAME}")
-    
-    # Create experiment
-    vertex_ai.init(experiment=EXPERIMENT_NAME)
-    # vertex_ai.start_run(RUN_NAME,resume=True) # RUN_NAME
-    
-#     with vertex_ai.start_run(RUN_NAME) as my_run:
-#         logging.info(f"logging metaparams")
-#         my_run.log_params(metaparams)
-        
-#         logging.info(f"logging hyperparams")
-#         my_run.log_params(hyperparams)
-        
+    # IF CHIEF, LOG to EXPERIMENT
     # if _is_chief(task_type, task_id):
     if task_type == 'chief':
-        logging.info(f"_is_chief task_type:{task_type}")
-        logging.info(f"_is_chief task_id:{task_id}")
-        with vertex_ai.start_run(RUN_NAME) as my_run:
-            logging.info(f"logging metaparams")
-            my_run.log_params(metaparams)
-            
-            logging.info(f"logging hyperparams")
-            my_run.log_params(hyperparams)
-        
-    # ====================================================
-    # Compile, Adapt, and Train model
-    # ====================================================
-    logging.info('Setting model adapts and compiling the model')
-    
-    LAYER_SIZES = get_arch_from_string(args.layer_sizes)
-    logging.info(f'LAYER_SIZES: {LAYER_SIZES}')
-    
-    logging.info(f'adapting layers: {cfg.NEW_ADAPTS}') # args.new_adapts | cfg.NEW_ADAPTS
-    
-    # Wrap variable creation within strategy scope
-    with strategy.scope():
+        logging.info(f" task_type logging experiments: {task_type}")
+        logging.info(f" task_id logging experiments: {task_id}")
 
-        model = trainer_model.TheTwoTowers(LAYER_SIZES, vocab_dict_load, parsed_candidate_dataset) #, max_padding_len=args.max_padding)
-        
-        # model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_train_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: use cached_train or shuffled_parsed_train_ds ?
-        # artist_name_can
-        # track_name_can
-        # album_name_can
-        # artist_genres_can
-        
-        # if cfg.NEW_ADAPTS:
-            # model.query_tower.pl_name_text_embedding.layers[0].adapt(shuffled_parsed_ds.map(lambda x: x['name']).batch(args.batch_size)) # TODO: adapts on full dataset or train onl
-            
-        model.compile(optimizer=tf.keras.optimizers.Adagrad(args.learning_rate))
-        
-    # if cfg.NEW_ADAPTS:
-        # vocab_dict_load['name'] = model.query_tower.pl_name_text_embedding.layers[0].get_vocabulary()
-        # bucket = storage_client.bucket(args.train_output_gcs_bucket)                               # TODO: args.train_output_gcs_bucket # replaced args.model_dir
-        # blob = bucket.blob(f'{EXPERIMENT_NAME}/{RUN_NAME}/vocabs_stats/vocab_dict_{RUN_NAME}.txt') # replaced f'{args.version}/vocabs_stats/vocab_dict_{RUN_NAME}.txt'
-        # pickle_out = pkl.dumps(vocab_dict_load)
-        # blob.upload_from_string(pickle_out)
-    
-    logging.info('Adapts finish - training next')
-        
-    tf.random.set_seed(args.seed)
-    
-    logs_dir = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/tb-logs'         # replaced f"{WORKING_DIR}/tb-logs-{RUN_NAME}" 
-    AIP_LOGS = os.environ.get('AIP_TENSORBOARD_LOG_DIR', f'{logs_dir}')
-    logging.info(f'TensorBoard logdir: {AIP_LOGS}')
-    
-    cloud_profiler.init()
-    
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(
-        log_dir=AIP_LOGS,
-        histogram_freq=0, 
-        write_graph=True, 
-        # profile_batch = '500,520'
-    )
-    
-    # if os.environ.get('AIP_TENSORBOARD_LOG_DIR', 'NA') is not 'NA':
-    #     tensorboard_callback = tf.keras.callbacks.TensorBoard(
-    #         log_dir=os.environ['AIP_TENSORBOARD_LOG_DIR'],
-    #         histogram_freq=0, write_graph=True, profile_batch = '500,520')
-    # else:
-    #     os.mkdir('/tb_logs')
-    #     tensorboard_callback = tf.keras.callbacks.TensorBoard(
-    #         log_dir='/tb_logs',
-    #         histogram_freq=0)
-    
-    logging.info('Training starting')
-    start_model_fit = time.time()
-    
-    layer_history = model.fit(
-        train_dataset,
-        # validation_data=valid_dataset,
-        # validation_freq=args.valid_frequency, # no longer used due to long-running brute force see scann validation belo
-        callbacks=tensorboard_callback,
-        # steps_per_epoch=10, #for debugging purposes
-        epochs=args.num_epochs,
-        verbose=1
-    )
-    
-    # capture elapsed time
-    end_model_fit = time.time()
-    elapsed_model_fit = end_model_fit - start_model_fit
-    elapsed_model_fit = round(elapsed_model_fit, 2)
-    logging.info(f'Elapsed model_fit: {elapsed_model_fit} seconds')
-        
-    # ====================================================
-    # Aprroximate Validation with ScaNN
-    # ====================================================
-    # Get candidate item (songs/tracks) embeddings
-    song_embeddings = parsed_candidate_dataset.batch(2048).map(
-        model.candidate_tower, 
-        num_parallel_calls=tf.data.AUTOTUNE
-    ).prefetch(
-        tf.data.AUTOTUNE
-    ).with_options(options)
-    
-    logging.info("Creating ScaNN layer for approximate validation metrics")
-    start_scann_layer = time.time()
-    
-    # Compute predictions
-    with strategy.scope():
-        scann = tfrs.layers.factorized_top_k.ScaNN(
-            num_reordering_candidates=500,         # TODO: parameterize
-            num_leaves_to_search=30                # TODO: parameterize
-        )
-        scann.index_from_dataset(song_embeddings)
-    
-    # with strategy.scope():
-        model.task.factorized_metrics = tfrs.metrics.FactorizedTopK(
-            candidates=scann
-        )
-        model.compile()
-    
-    # capture elapsed time
-    end_scann_layer = time.time()
-    elapsed_scann_layer = end_scann_layer - start_scann_layer
-    elapsed_scann_layer = round(elapsed_scann_layer, 2)
-    logging.info(f'Elapsed ScaNN Layer: {elapsed_scann_layer} seconds')
-    
-    logging.info("custom scann layer generation for validation complete")
-    #TODO - perhaps output the scann layer for indexing use if needed
-
-    # ====================================================
-    # Eval Metrics
-    # ====================================================
-    logging.info('Getting evaluation metrics')
-    start_evaluation = time.time()
-    
-    val_metrics = model.evaluate(
-        valid_dataset,
-        verbose="auto",
-        return_dict=True,
-        callbacks=tensorboard_callback,
-    ) #check performance
-    
-    # capture elapsed time
-    end_evaluation = time.time()
-    elapsed_evaluation = end_evaluation - start_evaluation
-    elapsed_evaluation = round(elapsed_evaluation, 2)
-    logging.info(f'Elapsed model Evaluation: {elapsed_evaluation} seconds')
-
-    logging.info('Validation metrics below:')
-    logging.info(val_metrics)
-    
-    time_metrics = {}
-    time_metrics["elapsed_model_fit"] = elapsed_model_fit
-    time_metrics["elapsed_scann_layer"] = elapsed_scann_layer
-    time_metrics["elapsed_evaluation"] = elapsed_evaluation
-    
-    
-    # if _is_chief(task_type, task_id):
-    if task_type == 'chief':
-        with vertex_ai.start_run(RUN_NAME,resume=True) as my_run:
-            logging.info(f"logging metrics to experiment run {RUN_NAME}")
+        with vertex_ai.start_run(RUN_NAME, tensorboard=EXPERIMENT_TENSORBOARD) as my_run:
+            logging.info(f"logging metrics...")
             my_run.log_metrics(val_metrics)
             my_run.log_metrics(time_metrics)
+
+            logging.info(f"logging metaparams...")
+            my_run.log_params(metaparams)
+
+            logging.info(f"logging hyperparams...")
+            my_run.log_params(hyperparams)
+
+            vertex_ai.end_run()
+            logging.info(f"EXPERIMENT RUN: {RUN_NAME} has ended")
+
+    
+    # # if _is_chief(task_type, task_id):
+    # if task_type == 'chief':
+    #     with vertex_ai.start_run(RUN_NAME,resume=True) as my_run:
+    #         logging.info(f"logging metrics to experiment run {RUN_NAME}")
+    #         my_run.log_metrics(val_metrics)
+    #         my_run.log_metrics(time_metrics)
     
     # logging.info(f"Ending experiment run: {RUN_NAME}")
     # vertex_ai.end_run()
@@ -431,7 +464,9 @@ def main(args):
     # Save Towers
     # ====================================================
     
-    MODEL_DIR_GCS_URI = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/model-dir'
+    # MODEL_DIR_GCS_URI = f'gs://{args.train_output_gcs_bucket}/{EXPERIMENT_NAME}/{RUN_NAME}/model-dir'
+    MODEL_DIR_GCS_URI = f'{WORKING_DIR_GCS_URI}/model-dir'
+    
     logging.info(f'Saving models to {MODEL_DIR_GCS_URI}')
 
     query_dir_save = f"{MODEL_DIR_GCS_URI}/query_tower/"                                      # replaced: f"gs://{args.model_dir}/{args.version}/{RUN_NAME}/query_tower/" 
@@ -564,6 +599,17 @@ def parse_args():
     
     parser.add_argument('--data_regime', 
                         type=str, help='id for tracking different datasets', required=True)
+    
+    parser.add_argument(
+        '--experiment_tb', 
+        type=str, 
+        help='''
+        The Vertex AI TensorBoard instance, 
+        Tensorboard resource name,
+        or Tensorboard resource ID
+        ''',
+        required=False
+    )
 
 
     # args = parser.parse_args()
